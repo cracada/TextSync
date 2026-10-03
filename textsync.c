@@ -4,6 +4,8 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <stdio.h>
 #include <string.h>
@@ -113,29 +115,33 @@ static void fn(struct mg_connection *c, int ev, void *ev_data) {
   }
 }
 
-/* ---------- 获取本机局域网 IPv4 ---------- */
-static void get_local_ip(char *buf, size_t len, int port) {
+/* ---------- 兜底方案：枚举网卡 ---------- */
+static int get_ip_by_adapters(char *out, size_t out_len) {
   ULONG outBufLen = 15000;
   PIP_ADAPTER_ADDRESSES pAddresses = (IP_ADAPTER_ADDRESSES *) malloc(outBufLen);
-  if (pAddresses == NULL) {
-    snprintf(buf, len, "http://127.0.0.1:%d", port);
-    return;
-  }
-  if (GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, NULL,
-                           pAddresses, &outBufLen) == NO_ERROR) {
+  if (pAddresses == NULL) return 0;
+
+  int found = 0;
+  if (GetAdaptersAddresses(
+          AF_INET,
+          GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+          GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_INCLUDE_PREFIX,
+          NULL, pAddresses, &outBufLen) == NO_ERROR) {
     PIP_ADAPTER_ADDRESSES pCurr = pAddresses;
-    while (pCurr) {
-      if (pCurr->OperStatus == IfOperStatusUp) {
+    while (pCurr && !found) {
+      if (pCurr->OperStatus == IfOperStatusUp &&
+          pCurr->IfType != IF_TYPE_SOFTWARE_LOOPBACK) {
         PIP_ADAPTER_UNICAST_ADDRESS pUnicast = pCurr->FirstUnicastAddress;
         while (pUnicast) {
           if (pUnicast->Address.lpSockaddr->sa_family == AF_INET) {
             struct sockaddr_in *sa =
                 (struct sockaddr_in *) pUnicast->Address.lpSockaddr;
             const char *ip = inet_ntoa(sa->sin_addr);
-            if (strcmp(ip, "127.0.0.1") != 0) {
-              snprintf(buf, len, "http://%s:%d", ip, port);
-              free(pAddresses);
-              return;
+            if (strcmp(ip, "127.0.0.1") != 0 && strcmp(ip, "0.0.0.0") != 0) {
+              strncpy(out, ip, out_len - 1);
+              out[out_len - 1] = '\0';
+              found = 1;
+              break;
             }
           }
           pUnicast = pUnicast->Next;
@@ -145,7 +151,48 @@ static void get_local_ip(char *buf, size_t len, int port) {
     }
   }
   free(pAddresses);
+  return found;
+}
+
+/* ---------- 获取本机局域网 IPv4（两段式） ---------- */
+static void get_local_ip(char *buf, size_t len, int port) {
+  /* 默认回环 */
   snprintf(buf, len, "http://127.0.0.1:%d", port);
+
+  /* 第一段：UDP socket trick，只查路由表，不发包，通常 <1ms */
+  SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+  if (s != INVALID_SOCKET) {
+    struct sockaddr_in target;
+    memset(&target, 0, sizeof(target));
+    target.sin_family      = AF_INET;
+    target.sin_port        = htons(53);
+    target.sin_addr.s_addr = inet_addr("8.8.8.8");
+
+    if (connect(s, (struct sockaddr *) &target, sizeof(target)) == 0) {
+      struct sockaddr_in local;
+      int llen = sizeof(local);
+      if (getsockname(s, (struct sockaddr *) &local, &llen) == 0) {
+        if (local.sin_addr.s_addr != 0 &&
+            local.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+          char ip[INET_ADDRSTRLEN];
+          if (inet_ntop(AF_INET, &local.sin_addr, ip, sizeof(ip))) {
+            snprintf(buf, len, "http://%s:%d", ip, port);
+            closesocket(s);
+            return;
+          }
+        }
+      }
+    }
+    closesocket(s);
+  }
+
+  /* 第二段：兜底，枚举网卡 */
+  {
+    char ip[INET_ADDRSTRLEN];
+    if (get_ip_by_adapters(ip, sizeof(ip))) {
+      snprintf(buf, len, "http://%s:%d", ip, port);
+    }
+  }
 }
 
 /* ---------- 复制 UTF-8 文本到剪贴板 ---------- */
@@ -568,8 +615,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   (void) hPrevInstance;
   (void) nCmdShow;
 
+  /* 先初始化 Winsock，get_local_ip 里的 UDP trick 需要 */
+  WSADATA wsa;
+  WSAStartup(MAKEWORD(2, 2), &wsa);
+
   s_port = parse_port(lpCmdLine);
   snprintf(s_listen_on, sizeof(s_listen_on), "http://0.0.0.0:%d", s_port);
+
+  /* 两段式获取本机 IP：UDP trick 快命中，失败回退枚举网卡 */
   get_local_ip(s_url, sizeof(s_url), s_port);
 
   WNDCLASSEXW wc = {0};
@@ -580,7 +633,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
   wc.hbrBackground = (HBRUSH) GetStockObject(WHITE_BRUSH);
   wc.lpszClassName = L"TextSyncQR";
-  if (!RegisterClassExW(&wc)) return 1;
+  if (!RegisterClassExW(&wc)) {
+    WSACleanup();
+    return 1;
+  }
 
   RECT rc = {0, 0, CLIENT_W, CLIENT_H};
   DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
@@ -597,7 +653,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                            L"\u5B9E\u65F6\u6587\u672C\u540C\u6B65",
                            style, x, y, ww, wh,
                            NULL, NULL, hInstance, NULL);
-  if (g_hwnd == NULL) return 1;
+  if (g_hwnd == NULL) {
+    WSACleanup();
+    return 1;
+  }
 
   ShowWindow(g_hwnd, SW_SHOW);
   UpdateWindow(g_hwnd);
@@ -622,5 +681,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   }
 
   mg_mgr_free(&s_mgr);
+  WSACleanup();
   return 0;
 }
