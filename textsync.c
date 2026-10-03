@@ -2,6 +2,7 @@
 #include "qrcodegen.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <windowsx.h>
 #include <shellapi.h>
 #include <iphlpapi.h>
 #include <stdio.h>
@@ -9,22 +10,37 @@
 #include <stdlib.h>
 #include <wchar.h>
 
-#define WM_TRAYICON (WM_USER + 1)
-#define ID_TRAYICON 1
-#define IDM_OPEN 1001
-#define IDM_EXIT 1002
-#define IDM_HELP 1003
-#define IDM_QR   1004
 #define DEFAULT_PORT 18900
 
+/* 布局参数 */
+#define PAD        16
+#define LINE_H     22
+#define QR_SIZE    260
+#define CLIENT_W   320
+#define CLIENT_H   350
+
+#define IDT_COPY_TIP 1
+
 static char s_listen_on[64] = "http://0.0.0.0:18900";
-static NOTIFYICONDATAW nid;
 static char s_url[256] = "http://127.0.0.1:18900";
-static HWND g_hwnd = NULL;
-static HWND g_qr_hwnd = NULL;
 static struct mg_mgr s_mgr;
 static int g_running = 1;
 static int s_port = DEFAULT_PORT;
+
+static HWND  g_hwnd = NULL;
+static HFONT g_font_url  = NULL;
+static HFONT g_font_hint = NULL;
+
+static RECT g_rc_qr  = {0, 0, 0, 0};
+static RECT g_rc_url = {0, 0, 0, 0};
+static int  g_url_hot = 0;
+
+/* ---- 自绘提示窗口 ---- */
+static HWND    g_tip_hwnd = NULL;
+static HFONT   g_font_tip = NULL;
+static wchar_t g_tip_text[256] = L"";
+static int     g_qr_hovered = 0;
+static int     g_copy_tip_shown = 0;
 
 /* ---------- UTF-8 -> UTF-16 ---------- */
 static void u2w(const char *src, wchar_t *dst, int dst_len) {
@@ -159,201 +175,381 @@ static void copy_text_to_clipboard(HWND hwnd, const char *utf8) {
   }
 }
 
-/* ---------- 二维码窗口过程 ---------- */
-static LRESULT CALLBACK QRWndProc(HWND hwnd, UINT msg, WPARAM wParam,
-                                  LPARAM lParam) {
+/* ---------- 字体 ---------- */
+static HFONT create_font(int height, int weight, BOOL underline) {
+  return CreateFontW(-height, 0, 0, 0, weight, FALSE, underline, FALSE,
+                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                     L"Microsoft YaHei UI");
+}
+
+/* ---------- 自绘提示窗口 ---------- */
+static LRESULT CALLBACK TipWndProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                   LPARAM lParam) {
   switch (msg) {
-    case WM_LBUTTONUP:
-      ShellExecuteA(NULL, "open", s_url, NULL, NULL, SW_SHOWNORMAL);
-      return 0;
-    case WM_RBUTTONUP:
-      copy_text_to_clipboard(hwnd, s_url);
-      return 0;
     case WM_PAINT: {
       PAINTSTRUCT ps;
       HDC hdc = BeginPaint(hwnd, &ps);
       RECT rc;
       GetClientRect(hwnd, &rc);
-      int w = rc.right - rc.left;
-      int h = rc.bottom - rc.top;
 
-      HBRUSH hWhite = (HBRUSH) GetStockObject(WHITE_BRUSH);
-      FillRect(hdc, &rc, hWhite);
+      /* 经典淡黄底 (255,255,225) */
+      HBRUSH hBrush = CreateSolidBrush(RGB(255, 255, 225));
+      FillRect(hdc, &rc, hBrush);
+      DeleteObject(hBrush);
 
-      uint8_t qrcode[qrcodegen_BUFFER_LEN_MAX];
-      uint8_t tempBuffer[qrcodegen_BUFFER_LEN_MAX];
-      BOOL ok = qrcodegen_encodeText(s_url, tempBuffer, qrcode,
-                                     qrcodegen_Ecc_MEDIUM,
-                                     qrcodegen_VERSION_MIN,
-                                     qrcodegen_VERSION_MAX,
-                                     qrcodegen_Mask_AUTO, true);
-      if (ok) {
-        int size = qrcodegen_getSize(qrcode);
-        int quiet = 4;
-        int total = size + quiet * 2;
-        int side = (w < h ? w : h);
-        int module_px = side / total;
-        if (module_px < 1) module_px = 1;
-        int qr_px = module_px * total;
-        int ox = (w - qr_px) / 2 + quiet * module_px;
-        int oy = (h - qr_px) / 2 + quiet * module_px;
+      /* 深灰细边框 */
+      HPEN hPen = CreatePen(PS_SOLID, 1, RGB(118, 118, 118));
+      HPEN oldPen = (HPEN) SelectObject(hdc, hPen);
+      HBRUSH oldBrush = (HBRUSH) SelectObject(hdc, GetStockObject(NULL_BRUSH));
+      Rectangle(hdc, 0, 0, rc.right, rc.bottom);
+      SelectObject(hdc, oldPen);
+      SelectObject(hdc, oldBrush);
+      DeleteObject(hPen);
 
-        HBRUSH hBlack = (HBRUSH) GetStockObject(BLACK_BRUSH);
-        for (int y = 0; y < size; y++) {
-          for (int x = 0; x < size; x++) {
-            if (qrcodegen_getModule(qrcode, x, y)) {
-              RECT r;
-              r.left   = ox + x * module_px;
-              r.top    = oy + y * module_px;
-              r.right  = ox + (x + 1) * module_px;
-              r.bottom = oy + (y + 1) * module_px;
-              FillRect(hdc, &r, hBlack);
-            }
-          }
-        }
-      }
+      /* 黑字 */
+      SetBkMode(hdc, TRANSPARENT);
+      SetTextColor(hdc, RGB(0, 0, 0));
+      HFONT oldFont = (HFONT) SelectObject(hdc, g_font_tip);
+      RECT trc = rc;
+      trc.left += 8;
+      trc.right -= 8;
+      DrawTextW(hdc, g_tip_text, -1, &trc,
+                DT_LEFT | DT_VCENTER | DT_NOPREFIX | DT_SINGLELINE);
+      SelectObject(hdc, oldFont);
+
       EndPaint(hwnd, &ps);
       return 0;
     }
-    case WM_CLOSE:
-      DestroyWindow(hwnd);
-      return 0;
-    case WM_DESTROY:
-      g_qr_hwnd = NULL;
-      return 0;
-    default:
-      return DefWindowProcW(hwnd, msg, wParam, lParam);
+    case WM_ERASEBKGND:
+      return 1;
   }
+  return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-static void show_qr_window(HINSTANCE hInst) {
-  if (g_qr_hwnd != NULL && IsWindow(g_qr_hwnd)) {
-    SetForegroundWindow(g_qr_hwnd);
-    return;
-  }
+static void create_tip_window(HINSTANCE hInst) {
+  WNDCLASSEXW wc = {0};
+  wc.cbSize        = sizeof(wc);
+  wc.lpfnWndProc   = TipWndProc;
+  wc.hInstance     = hInst;
+  wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+  wc.lpszClassName = L"TextSyncTip";
+  RegisterClassExW(&wc);
 
-  static BOOL s_registered = FALSE;
-  if (!s_registered) {
-    WNDCLASSEXW wc = {0};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = QRWndProc;
-    wc.hInstance = hInst;
-    wc.hCursor = LoadCursor(NULL, IDC_HAND);
-    wc.hbrBackground = (HBRUSH) GetStockObject(WHITE_BRUSH);
-    wc.lpszClassName = L"TextSyncQR";
-    RegisterClassExW(&wc);
-    s_registered = TRUE;
-  }
+  g_font_tip = create_font(13, FW_NORMAL, FALSE);
 
-  RECT rc = {0, 0, 300, 300};
-  AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
-  int ww = rc.right - rc.left;
-  int wh = rc.bottom - rc.top;
+  g_tip_hwnd = CreateWindowExW(
+      WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+      L"TextSyncTip", L"",
+      WS_POPUP,
+      0, 0, 10, 10,
+      NULL, NULL, hInst, NULL);
+}
 
+/* 在屏幕坐标 (sx, sy) 处显示提示，文本为 text */
+static void show_tip_at(const wchar_t *text, int sx, int sy) {
+  if (g_tip_hwnd == NULL) return;
+
+  wcsncpy(g_tip_text, text, 255);
+  g_tip_text[255] = L'\0';
+
+  /* 根据文字计算窗口大小 */
+  HDC hdc = GetDC(g_tip_hwnd);
+  HFONT oldFont = (HFONT) SelectObject(hdc, g_font_tip);
+  RECT rc = {0, 0, 500, 0};
+  DrawTextW(hdc, g_tip_text, -1, &rc,
+            DT_CALCRECT | DT_LEFT | DT_NOPREFIX | DT_SINGLELINE);
+  SelectObject(hdc, oldFont);
+  ReleaseDC(g_tip_hwnd, hdc);
+
+  int w = rc.right - rc.left + 16;
+  int h = rc.bottom - rc.top + 8;
+  if (w < 60) w = 60;
+  if (h < 26) h = 26;
+
+  /* 避免超出屏幕右/下边缘 */
   int sw = GetSystemMetrics(SM_CXSCREEN);
   int sh = GetSystemMetrics(SM_CYSCREEN);
-  int x = (sw - ww) / 2;
-  int y = (sh - wh) / 2;
+  if (sx + w > sw) sx = sw - w - 2;
+  if (sy + h > sh) sy = sy - h - 24;
 
-  wchar_t wTitle[128];
-  u2w("\xE4\xBA\x8C\xE7\xBB\xB4\xE7\xA0\x81: \xE5\xB7\xA6\xE9\x94\xAE\xE6\x89\x93\xE5\xBC\x80URL"
-      "\xEF\xBC\x8C\xE5\x8F\xB3\xE9\x94\xAE\xE5\xA4\x8D\xE5\x88\xB6URL",
-      wTitle, 128); /* "二维码: 左键打开URL，右键复制URL" */
-
-  g_qr_hwnd = CreateWindowExW(
-      0, L"TextSyncQR", wTitle,
-      WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-      x, y, ww, wh,
-      NULL, NULL, hInst, NULL);
-
-  if (g_qr_hwnd != NULL) {
-    ShowWindow(g_qr_hwnd, SW_SHOW);
-    UpdateWindow(g_qr_hwnd);
-    SetForegroundWindow(g_qr_hwnd);
-  }
+  SetWindowPos(g_tip_hwnd, HWND_TOPMOST, sx, sy, w, h,
+               SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  InvalidateRect(g_tip_hwnd, NULL, TRUE);
+  UpdateWindow(g_tip_hwnd);
 }
 
-/* ---------- 托盘图标 ---------- */
-static void create_tray_icon(HWND hwnd) {
-  memset(&nid, 0, sizeof(nid));
-  nid.cbSize = sizeof(nid);
-  nid.hWnd = hwnd;
-  nid.uID = ID_TRAYICON;
-  nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-  nid.uCallbackMessage = WM_TRAYICON;
-  nid.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(101));
+static void hide_tip_window(void) {
+  if (g_tip_hwnd != NULL) ShowWindow(g_tip_hwnd, SW_HIDE);
+}
 
-  wchar_t wlabel[64];
+/* ---------- 计算布局 ---------- */
+static void compute_layout(HWND hwnd) {
+  RECT rc;
+  GetClientRect(hwnd, &rc);
+  int W = rc.right;
+  if (W <= 0) W = CLIENT_W;
+
+  int qs = QR_SIZE;
+  if (qs > W - 2 * PAD) qs = W - 2 * PAD;
+  if (qs < 40) qs = 40;
+
+  int top = PAD;
+  g_rc_qr.left   = (W - qs) / 2;
+  g_rc_qr.top    = top;
+  g_rc_qr.right  = g_rc_qr.left + qs;
+  g_rc_qr.bottom = top + qs;
+
   wchar_t wurl[256];
-  u2w("\xE6\x96\x87\xE6\x9C\xAC\xE5\x90\x8C\xE6\xAD\xA5", wlabel, 64); /* "文本同步" */
   u2w(s_url, wurl, 256);
 
-  _snwprintf(nid.szTip, 128, L"%ls - %ls", wlabel, wurl);
-  nid.szTip[127] = L'\0';
+  int cx = 0, cy = 24;
+  if (g_font_url != NULL) {
+    HDC hdc = GetDC(hwnd);
+    HFONT old = (HFONT) SelectObject(hdc, g_font_url);
+    SIZE sz = {0, 0};
+    GetTextExtentPoint32W(hdc, wurl, (int) wcslen(wurl), &sz);
+    SelectObject(hdc, old);
+    ReleaseDC(hwnd, hdc);
+    cx = sz.cx;
+    if (sz.cy > 0) cy = sz.cy;
+  }
 
-  Shell_NotifyIconW(NIM_ADD, &nid);
-}
-
-static void show_tray_menu(HWND hwnd) {
-  POINT pt;
-  GetCursorPos(&pt);
-
-  wchar_t wOpen[32], wQR[32], wHelp[32], wExit[32];
-  u2w("\xE6\x89\x93\xE5\xBC\x80", wOpen, 32);                        /* "打开" */
-  u2w("\xE4\xBA\x8C\xE7\xBB\xB4\xE7\xA0\x81", wQR, 32);              /* "二维码" */
-  u2w("\xE5\xB8\xAE\xE5\x8A\xA9", wHelp, 32);                        /* "帮助" */
-  u2w("\xE9\x80\x80\xE5\x87\xBA", wExit, 32);                        /* "退出" */
-
-  HMENU hMenu = CreatePopupMenu();
-  AppendMenuW(hMenu, MF_STRING, IDM_OPEN, wOpen);
-  AppendMenuW(hMenu, MF_STRING, IDM_QR, wQR);
-  AppendMenuW(hMenu, MF_STRING, IDM_HELP, wHelp);
-  AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-  AppendMenuW(hMenu, MF_STRING, IDM_EXIT, wExit);
-
-  SetForegroundWindow(hwnd);
-  TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
-  DestroyMenu(hMenu);
+  int uy = g_rc_qr.bottom + 12;
+  g_rc_url.left   = (W - cx) / 2;
+  g_rc_url.top    = uy;
+  g_rc_url.right  = g_rc_url.left + cx;
+  g_rc_url.bottom = uy + cy;
 }
 
 /* ---------- 主窗口过程 ---------- */
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam,
                                 LPARAM lParam) {
   switch (msg) {
-    case WM_TRAYICON:
-      if (lParam == WM_LBUTTONUP) {
-        ShellExecuteA(NULL, "open", s_url, NULL, NULL, SW_SHOWNORMAL);
-      } else if (lParam == WM_RBUTTONUP) {
-        show_tray_menu(hwnd);
+    case WM_CREATE:
+      g_font_url  = create_font(17, FW_NORMAL, TRUE);
+      g_font_hint = create_font(13, FW_NORMAL, FALSE);
+      create_tip_window(((LPCREATESTRUCTW) lParam)->hInstance);
+      compute_layout(hwnd);
+      return 0;
+
+    case WM_SIZE:
+      compute_layout(hwnd);
+      return 0;
+
+    case WM_ERASEBKGND: {
+      RECT rc;
+      GetClientRect(hwnd, &rc);
+      FillRect((HDC) wParam, &rc, (HBRUSH) GetStockObject(WHITE_BRUSH));
+      return 1;
+    }
+
+    case WM_PAINT: {
+      PAINTSTRUCT ps;
+      HDC hdc = BeginPaint(hwnd, &ps);
+      RECT rc;
+      GetClientRect(hwnd, &rc);
+      FillRect(hdc, &rc, (HBRUSH) GetStockObject(WHITE_BRUSH));
+      SetBkMode(hdc, TRANSPARENT);
+
+      RECT r;
+
+      /* ---- 二维码 ---- */
+      {
+        uint8_t qrcode[qrcodegen_BUFFER_LEN_MAX];
+        uint8_t tempBuffer[qrcodegen_BUFFER_LEN_MAX];
+        BOOL ok = qrcodegen_encodeText(s_url, tempBuffer, qrcode,
+                                       qrcodegen_Ecc_MEDIUM,
+                                       qrcodegen_VERSION_MIN,
+                                       qrcodegen_VERSION_MAX,
+                                       qrcodegen_Mask_AUTO, true);
+        if (ok) {
+          int size = qrcodegen_getSize(qrcode);
+          int quiet = 4;
+          int total = size + quiet * 2;
+          int w = g_rc_qr.right - g_rc_qr.left;
+          int h = g_rc_qr.bottom - g_rc_qr.top;
+          int side = (w < h ? w : h);
+          int module_px = side / total;
+          if (module_px < 1) module_px = 1;
+          int qr_px = module_px * total;
+          int ox = g_rc_qr.left + (w - qr_px) / 2 + quiet * module_px;
+          int oy = g_rc_qr.top  + (h - qr_px) / 2 + quiet * module_px;
+
+          HBRUSH hBlack = (HBRUSH) GetStockObject(BLACK_BRUSH);
+          for (int y = 0; y < size; y++) {
+            for (int x = 0; x < size; x++) {
+              if (qrcodegen_getModule(qrcode, x, y)) {
+                RECT q;
+                q.left   = ox + x * module_px;
+                q.top    = oy + y * module_px;
+                q.right  = ox + (x + 1) * module_px;
+                q.bottom = oy + (y + 1) * module_px;
+                FillRect(hdc, &q, hBlack);
+              }
+            }
+          }
+        }
+      }
+
+      /* ---- URL（可点击，居中，带下划线） ---- */
+      {
+        wchar_t wurl[256];
+        u2w(s_url, wurl, 256);
+        SelectObject(hdc, g_font_url);
+        SetTextColor(hdc, g_url_hot ? RGB(214, 69, 65) : RGB(0, 102, 204));
+        r.left = 0; r.right = rc.right;
+        r.top = g_rc_url.top; r.bottom = g_rc_url.bottom;
+        DrawTextW(hdc, wurl, -1, &r,
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+      }
+
+      /* ---- URL 下方提示 ---- */
+      SelectObject(hdc, g_font_hint);
+      SetTextColor(hdc, RGB(150, 150, 150));
+      r.left = 0; r.right = rc.right;
+      r.top = g_rc_url.bottom + 8;
+      r.bottom = r.top + LINE_H;
+      DrawTextW(hdc,
+                L"\u9ED8\u8BA4\u7AEF\u53E318900 \u53EF\u5728\u542F\u52A8\u65F6\u6307\u5B9A",
+                -1, &r,
+                DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+
+      EndPaint(hwnd, &ps);
+      return 0;
+    }
+
+    case WM_SETCURSOR:
+      if (LOWORD(lParam) == HTCLIENT) {
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(hwnd, &pt);
+        if (PtInRect(&g_rc_url, pt) || PtInRect(&g_rc_qr, pt)) {
+          SetCursor(LoadCursor(NULL, IDC_HAND));
+        } else {
+          SetCursor(LoadCursor(NULL, IDC_ARROW));
+        }
+        return TRUE;
       }
       break;
-    case WM_COMMAND:
-      if (LOWORD(wParam) == IDM_EXIT) {
-        DestroyWindow(hwnd);
-      } else if (LOWORD(wParam) == IDM_OPEN) {
-        ShellExecuteA(NULL, "open", s_url, NULL, NULL, SW_SHOWNORMAL);
-      } else if (LOWORD(wParam) == IDM_QR) {
-        show_qr_window(GetModuleHandleW(NULL));
-      } else if (LOWORD(wParam) == IDM_HELP) {
-        wchar_t wTitle[32], wMsg[512];
-        u2w("\xE5\xB8\xAE\xE5\x8A\xA9", wTitle, 32);
-        u2w("\xE9\xBB\x98\xE8\xAE\xA4\xE7\xAB\xAF\xE5\x8F\xA3\xE4\xB8\xBA 18900\xEF\xBC\x8C"
-            "\xE5\x90\xAF\xE5\x8A\xA8\xE6\x97\xB6\xE5\x8F\xAF\xE4\xBB\xA5\xE7\x9B\xB4\xE6\x8E\xA5"
-            "\xE8\xB7\x9F\xE9\x9A\x8F\xE7\xAB\xAF\xE5\x8F\xA3\xE5\x8F\xB7\xE6\x9D\xA5"
-            "\xE6\x8C\x87\xE5\xAE\x9A\xE6\x9C\x8D\xE5\x8A\xA1\xE7\xAB\xAF\xE5\x8F\xA3",
-            wMsg, 512);
-        MessageBoxW(hwnd, wMsg, wTitle, MB_OK | MB_ICONINFORMATION);
+
+    case WM_MOUSEMOVE: {
+      POINT pt;
+      pt.x = GET_X_LPARAM(lParam);
+      pt.y = GET_Y_LPARAM(lParam);
+
+      int in_qr  = PtInRect(&g_rc_qr, pt)  ? 1 : 0;
+      int in_url = PtInRect(&g_rc_url, pt) ? 1 : 0;
+
+      int hot = (in_qr || in_url) ? 1 : 0;
+      if (hot != g_url_hot) {
+        g_url_hot = hot;
+        InvalidateRect(hwnd, NULL, FALSE);
       }
-      break;
+
+      /* 二维码悬停：显示操作提示 */
+      if (in_qr) {
+        if (!g_copy_tip_shown) {
+          POINT sp = pt;
+          ClientToScreen(hwnd, &sp);
+          show_tip_at(L"\u5DE6\u952E\u6253\u5F00URL  \u53F3\u952E\u590D\u5236URL",
+                      sp.x + 16, sp.y + 20);
+        }
+      } else {
+        if (g_qr_hovered) {
+          g_qr_hovered = 0;
+          if (!g_copy_tip_shown) hide_tip_window();
+        }
+      }
+      g_qr_hovered = in_qr;
+
+      /* 请求 WM_MOUSELEAVE */
+      {
+        TRACKMOUSEEVENT tme;
+        tme.cbSize = sizeof(tme);
+        tme.dwFlags = TME_LEAVE;
+        tme.hwndTrack = hwnd;
+        tme.dwHoverTime = 0;
+        TrackMouseEvent(&tme);
+      }
+      return 0;
+    }
+
+    case WM_MOUSELEAVE:
+      if (g_qr_hovered) {
+        g_qr_hovered = 0;
+        if (!g_copy_tip_shown) hide_tip_window();
+      }
+      if (g_url_hot) {
+        g_url_hot = 0;
+        InvalidateRect(hwnd, NULL, FALSE);
+      }
+      return 0;
+
+    /* 左键：二维码区 / URL 区 -> 打开网页 */
+    case WM_LBUTTONUP: {
+      POINT pt;
+      pt.x = GET_X_LPARAM(lParam);
+      pt.y = GET_Y_LPARAM(lParam);
+      if (PtInRect(&g_rc_url, pt) || PtInRect(&g_rc_qr, pt)) {
+        ShellExecuteA(NULL, "open", s_url, NULL, NULL, SW_SHOWNORMAL);
+      }
+      return 0;
+    }
+
+    /* 右键：二维码区 / URL 区 -> 复制 URL，显示“已复制” */
+    case WM_RBUTTONUP: {
+      POINT pt;
+      pt.x = GET_X_LPARAM(lParam);
+      pt.y = GET_Y_LPARAM(lParam);
+      if (PtInRect(&g_rc_qr, pt) || PtInRect(&g_rc_url, pt)) {
+        copy_text_to_clipboard(hwnd, s_url);
+
+        POINT sp = pt;
+        ClientToScreen(hwnd, &sp);
+        show_tip_at(L"\u5DF2\u590D\u5236", sp.x + 16, sp.y + 20);
+
+        g_copy_tip_shown = 1;
+        SetTimer(hwnd, IDT_COPY_TIP, 1300, NULL);
+      }
+      return 0;
+    }
+
+    case WM_TIMER:
+      if (wParam == IDT_COPY_TIP) {
+        KillTimer(hwnd, IDT_COPY_TIP);
+        g_copy_tip_shown = 0;
+        /* 鼠标若仍在二维码上，恢复显示操作提示 */
+        if (g_qr_hovered) {
+          POINT sp;
+          GetCursorPos(&sp);
+          show_tip_at(L"\u5DE6\u952E\u6253\u5F00URL  \u53F3\u952E\u590D\u5236URL",
+                      sp.x + 16, sp.y + 20);
+        } else {
+          hide_tip_window();
+        }
+      }
+      return 0;
+
+    case WM_CLOSE:
+      DestroyWindow(hwnd);
+      return 0;
+
     case WM_DESTROY:
-      Shell_NotifyIconW(NIM_DELETE, &nid);
+      KillTimer(hwnd, IDT_COPY_TIP);
+      if (g_tip_hwnd) { DestroyWindow(g_tip_hwnd); g_tip_hwnd = NULL; }
+      if (g_font_tip) { DeleteObject(g_font_tip); g_font_tip = NULL; }
+      if (g_font_url)  { DeleteObject(g_font_url);  g_font_url  = NULL; }
+      if (g_font_hint) { DeleteObject(g_font_hint); g_font_hint = NULL; }
+      g_hwnd = NULL;
       g_running = 0;
       PostQuitMessage(0);
-      break;
+      return 0;
+
     default:
-      return DefWindowProcW(hwnd, msg, wParam, lParam);
+      break;
   }
-  return 0;
+  return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 /* ---------- 解析命令行端口 ---------- */
@@ -377,17 +573,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   get_local_ip(s_url, sizeof(s_url), s_port);
 
   WNDCLASSEXW wc = {0};
-  wc.cbSize = sizeof(wc);
-  wc.lpfnWndProc = WndProc;
-  wc.hInstance = hInstance;
-  wc.lpszClassName = L"TextSyncTray";
-  RegisterClassExW(&wc);
+  wc.cbSize        = sizeof(wc);
+  wc.style         = CS_HREDRAW | CS_VREDRAW;
+  wc.lpfnWndProc   = WndProc;
+  wc.hInstance     = hInstance;
+  wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+  wc.hbrBackground = (HBRUSH) GetStockObject(WHITE_BRUSH);
+  wc.lpszClassName = L"TextSyncQR";
+  if (!RegisterClassExW(&wc)) return 1;
 
-  g_hwnd = CreateWindowExW(0, L"TextSyncTray", L"TextSync", 0, 0, 0, 0, 0,
+  RECT rc = {0, 0, CLIENT_W, CLIENT_H};
+  DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+  AdjustWindowRect(&rc, style, FALSE);
+  int ww = rc.right - rc.left;
+  int wh = rc.bottom - rc.top;
+
+  int sw = GetSystemMetrics(SM_CXSCREEN);
+  int sh = GetSystemMetrics(SM_CYSCREEN);
+  int x = (sw - ww) / 2;
+  int y = (sh - wh) / 2;
+
+  g_hwnd = CreateWindowExW(0, L"TextSyncQR",
+                           L"\u5B9E\u65F6\u6587\u672C\u540C\u6B65",
+                           style, x, y, ww, wh,
                            NULL, NULL, hInstance, NULL);
   if (g_hwnd == NULL) return 1;
 
-  create_tray_icon(g_hwnd);
+  ShowWindow(g_hwnd, SW_SHOW);
+  UpdateWindow(g_hwnd);
 
   mg_mgr_init(&s_mgr);
   mg_log_set(MG_LL_NONE);
