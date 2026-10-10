@@ -115,6 +115,64 @@ static void fn(struct mg_connection *c, int ev, void *ev_data) {
   }
 }
 
+/* ---------- 端口是否可用（独占方式探测） ---------- */
+static int is_port_available(int port) {
+  if (port <= 0 || port > 65535) return 0;
+
+  SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+  if (s == INVALID_SOCKET) return 0;
+
+  /* Windows 上必须用 SO_EXCLUSIVEADDRUSE：
+     若别的进程用 SO_REUSEADDR 占了该端口，普通 bind 仍会“成功”，
+     导致误判为可用。 */
+  BOOL excl = TRUE;
+  setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+             (const char *) &excl, sizeof(excl));
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family      = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port        = htons((u_short) port);
+
+  int ok = (bind(s, (struct sockaddr *) &addr, sizeof(addr)) == 0);
+  closesocket(s);
+  return ok;
+}
+
+/* ---------- 让系统分配一个空闲端口 ---------- */
+static int pick_random_port(void) {
+  SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+  if (s == INVALID_SOCKET) return 0;
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family      = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port        = 0;   /* 0 = 由系统挑一个临时端口 */
+
+  int port = 0;
+  if (bind(s, (struct sockaddr *) &addr, sizeof(addr)) == 0) {
+    int alen = sizeof(addr);
+    if (getsockname(s, (struct sockaddr *) &addr, &alen) == 0) {
+      port = ntohs(addr.sin_port);
+    }
+  }
+  closesocket(s);
+  return port;
+}
+
+/* ---------- 尝试在指定端口启动监听，成功返回 1 ---------- */
+static int start_listen(int port) {
+  if (!is_port_available(port)) return 0;
+
+  snprintf(s_listen_on, sizeof(s_listen_on), "http://0.0.0.0:%d", port);
+  if (mg_http_listen(&s_mgr, s_listen_on, fn, NULL) == NULL) return 0;
+
+  s_port = port;
+  return 1;
+}
+
 /* ---------- 兜底方案：枚举网卡 ---------- */
 static int get_ip_by_adapters(char *out, size_t out_len) {
   ULONG outBufLen = 15000;
@@ -451,16 +509,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam,
                   DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
       }
 
-      /* ---- URL 下方提示 ---- */
+      /* ---- URL 下方提示（动态显示实际端口） ---- */
       SelectObject(hdc, g_font_hint);
       SetTextColor(hdc, RGB(150, 150, 150));
       r.left = 0; r.right = rc.right;
       r.top = g_rc_url.bottom + 8;
       r.bottom = r.top + LINE_H;
-      DrawTextW(hdc,
-                L"\u9ED8\u8BA4\u7AEF\u53E318900 \u53EF\u5728\u542F\u52A8\u65F6\u6307\u5B9A",
-                -1, &r,
-                DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+      {
+        wchar_t hint[128];
+        wsprintfW(hint,
+                  L"\u670D\u52A1\u7AEF\u53E3 %d \u53EF\u5728\u542F\u52A8\u65F6\u6307\u5B9A",
+                  s_port);
+        DrawTextW(hdc, hint, -1, &r,
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+      }
 
       EndPaint(hwnd, &ps);
       return 0;
@@ -599,14 +661,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam,
   return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-/* ---------- 解析命令行端口 ---------- */
+/* ---------- 解析命令行端口；返回 0 表示未指定 ---------- */
 static int parse_port(const char *cmdline) {
-  if (cmdline == NULL) return DEFAULT_PORT;
+  if (cmdline == NULL) return 0;
   while (*cmdline == ' ' || *cmdline == '\t' || *cmdline == '"') cmdline++;
-  if (*cmdline == '\0') return DEFAULT_PORT;
+  if (*cmdline == '\0') return 0;
   int p = atoi(cmdline);
   if (p > 0 && p < 65536) return p;
-  return DEFAULT_PORT;
+  return 0;
 }
 
 /* ---------- 入口 ---------- */
@@ -615,12 +677,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   (void) hPrevInstance;
   (void) nCmdShow;
 
-  /* 先初始化 Winsock，get_local_ip 里的 UDP trick 需要 */
+  /* 先初始化 Winsock，端口探测和 get_local_ip 里的 UDP trick 都需要 */
   WSADATA wsa;
   WSAStartup(MAKEWORD(2, 2), &wsa);
 
-  s_port = parse_port(lpCmdLine);
-  snprintf(s_listen_on, sizeof(s_listen_on), "http://0.0.0.0:%d", s_port);
+  mg_mgr_init(&s_mgr);
+  mg_log_set(MG_LL_NONE);
+
+  /* 期望端口：命令行指定优先，否则默认 18900 */
+  int desired = parse_port(lpCmdLine);
+  if (desired <= 0) desired = DEFAULT_PORT;
+
+  /* 先试期望端口；被占用就改用系统随机分配的端口 */
+  int listening = start_listen(desired);
+  if (!listening) {
+    for (int i = 0; i < 20 && !listening; i++) {
+      int rp = pick_random_port();
+      if (rp > 0) listening = start_listen(rp);
+    }
+  }
+  if (!listening) {
+    MessageBoxW(NULL,
+                L"\u65E0\u6CD5\u76D1\u542C\u4EFB\u4F55\u7AEF\u53E3",
+                L"\u9519\u8BEF", MB_OK | MB_ICONERROR);
+    mg_mgr_free(&s_mgr);
+    WSACleanup();
+    return 1;
+  }
 
   /* 两段式获取本机 IP：UDP trick 快命中，失败回退枚举网卡 */
   get_local_ip(s_url, sizeof(s_url), s_port);
@@ -634,6 +717,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   wc.hbrBackground = (HBRUSH) GetStockObject(WHITE_BRUSH);
   wc.lpszClassName = L"TextSyncQR";
   if (!RegisterClassExW(&wc)) {
+    mg_mgr_free(&s_mgr);
     WSACleanup();
     return 1;
   }
@@ -654,16 +738,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                            style, x, y, ww, wh,
                            NULL, NULL, hInstance, NULL);
   if (g_hwnd == NULL) {
+    mg_mgr_free(&s_mgr);
     WSACleanup();
     return 1;
   }
 
   ShowWindow(g_hwnd, SW_SHOW);
   UpdateWindow(g_hwnd);
-
-  mg_mgr_init(&s_mgr);
-  mg_log_set(MG_LL_NONE);
-  mg_http_listen(&s_mgr, s_listen_on, fn, NULL);
 
   MSG msg;
   while (g_running) {
